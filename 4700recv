@@ -1,0 +1,73 @@
+#!/usr/bin/env -S python3 -u
+
+import json, select, socket, sys
+
+def checksum(msg):
+    # position weighted sum of the message's bytes, used to detect corrupted packets
+    text = json.dumps(msg, sort_keys=True).encode("utf-8")
+    return sum((i + 1) * b for i, b in enumerate(text)) % 1000000007
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+        self.remote_host = None
+        self.remote_port = None
+        self.expect = 0 # sequence number of the next packet to print
+        self.buffer = {} #for packets that arrived early
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        message["check"] = checksum(message)
+        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.remote_host, self.remote_port))
+
+    def recv(self, conn):
+        # return a valid data packet or None if it is corrupt or from someone else
+        data, addr = conn.recvfrom(65535)
+        try:
+            msg = json.loads(data.decode("utf-8"))
+            check = msg.pop("check")
+            if checksum(msg) != check or msg["type"] != "msg":
+                raise ValueError("bad checksum")
+            int(msg["seq"]), str(msg["data"])
+        except Exception:
+            self.log("Dropped corrupt packet")
+            return None
+
+        # lock onto the first sender
+        if self.remote_host is None:
+            self.remote_host, self.remote_port = addr
+        if addr != (self.remote_host, self.remote_port):
+            self.log("Error:  Received response from unexpected remote; ignoring")
+            return None
+        return msg
+
+    def run(self):
+        while True:
+            select.select([self.socket], [], [])
+            msg = self.recv(self.socket)
+            if msg is None:
+                continue
+
+            seq = msg["seq"]
+            # keep new packets (ignore duplicates of ones already printed or buffered)
+            if seq >= self.expect and seq not in self.buffer:
+                self.buffer[seq] = msg["data"]
+
+            while self.expect in self.buffer:
+                print(self.buffer.pop(self.expect), end="", flush=True)
+                self.expect += 1
+
+            # Ack this packet
+            # "expect" also tells the sender everything before it arrived
+            # "time" is echoed back so the sender can measure the roundtrip time
+            self.send({"type": "ack", "seq": seq, "expect": self.expect, "time": msg["time"]})
+
+
+if __name__ == "__main__":
+    Receiver().run()

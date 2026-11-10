@@ -1,0 +1,117 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, json, select, socket, sys, time
+
+DATA_SIZE = 1375
+
+def checksum(msg):
+    # position weighted sum of the message's bytes, used to detect corrupted packets
+    text = json.dumps(msg, sort_keys=True).encode("utf-8")
+    return sum((i + 1) * b for i, b in enumerate(text)) % 1000000007
+
+
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = int(port)
+        self.log("Sender starting up using port %s" % self.port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", 0))
+        data = sys.stdin.read()
+        self.chunks = [data[i:i + DATA_SIZE] for i in range(0, len(data), DATA_SIZE)]
+        self.next_seq = 0 # next packet that has never been sent
+        self.unacked = {} # seq -> time it was last sent
+        self.acked = set()
+        self.highest_acked = -1
+        self.window = 2.0
+        self.ssthresh = 64.0
+        self.rtt = 1.0
+        self.last_cut = 0.0
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send_packet(self, seq):
+        msg = {"type": "msg", "seq": seq, "time": time.time(), "data": self.chunks[seq]}
+        msg["check"] = checksum(msg)
+        self.socket.sendto(json.dumps(msg).encode("utf-8"), (self.host, self.port))
+        self.unacked[seq] = time.time()
+
+    def recv(self, conn):
+        # return a valid ack or None if it is corrupt
+        data, addr = conn.recvfrom(65535)
+        try:
+            msg = json.loads(data.decode("utf-8"))
+            check = msg.pop("check")
+            if checksum(msg) != check or msg["type"] != "ack":
+                raise ValueError("bad checksum")
+            int(msg["seq"]), int(msg["expect"]), float(msg["time"])
+        except Exception:
+            self.log("Dropped corrupt ack")
+            return None
+        return msg
+
+    def mark_acked(self, seq):
+        # record one packet as delivered and grow the window
+        if seq in self.acked or seq >= len(self.chunks):
+            return
+        self.acked.add(seq)
+        self.unacked.pop(seq, None)
+        self.highest_acked = max(self.highest_acked, seq)
+        if self.window < self.ssthresh:
+            self.window += 1 # slow start: doubles every RTT
+        else:
+            self.window += 1 / self.window # congestion avoidance: +1 packet per RTT
+
+    def handle_ack(self, msg):
+        # update the RTT estimate from the echoed send time
+        sample = time.time() - msg["time"]
+        if sample > 0:
+            self.rtt = 0.875 * self.rtt + 0.125 * sample
+        self.mark_acked(msg["seq"])
+        for seq in range(min(msg["expect"], len(self.chunks))):
+            self.mark_acked(seq)
+
+    def on_loss(self):
+        # halve the window, but at most once per RTT 
+        now = time.time()
+        if now - self.last_cut > self.rtt:
+            self.ssthresh = max(self.window / 2, 2)
+            self.window = self.ssthresh
+            self.last_cut = now
+
+    def check_for_losses(self):
+        now = time.time()
+        for seq, sent in list(self.unacked.items()):
+            # lost if 3 newer packets were acked 
+            fast = self.highest_acked - seq >= 3 and now - sent > 1.5 * self.rtt
+            if fast or now - sent > 2 * self.rtt:
+                self.log("Retransmitting packet %d" % seq)
+                self.on_loss()
+                self.send_packet(seq)
+
+    def run(self):
+        while len(self.acked) < len(self.chunks):
+            #send new packets while the window allows
+            while len(self.unacked) < int(self.window) and self.next_seq < len(self.chunks):
+                self.send_packet(self.next_seq)
+                self.next_seq += 1
+
+            socks = select.select([self.socket], [], [], 0.01)[0]
+            if socks:
+                msg = self.recv(self.socket)
+                if msg:
+                    self.handle_ack(msg)
+            self.check_for_losses()
+        self.log("All done!")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="send data")
+    parser.add_argument("host", type=str, help="Remote host to connect to")
+    parser.add_argument("port", type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
